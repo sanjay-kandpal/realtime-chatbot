@@ -36,6 +36,28 @@
             border-radius: 15px;
             max-width: 70%;
             word-wrap: break-word;
+            position: relative;
+            opacity: 0.8;
+            transition: opacity 0.3s ease;
+        }
+        .message.delivered {
+            opacity: 1;
+        }
+        .message-status {
+            position: absolute;
+            bottom: 2px;
+            right: 8px;
+            font-size: 0.7em;
+            opacity: 0.7;
+        }
+        .message-status.sending {
+            color: #888;
+        }
+        .message-status.delivered {
+            color: #4CAF50;
+        }
+        .message-status.queued {
+            color: #FFC107;
         }
         .message.received {
             background: #e9e9e9;
@@ -116,8 +138,11 @@
         // Get username and room from URL or prompt
         const urlParams = new URLSearchParams(window.location.search);
         let username = urlParams.get('username');
+        console.log('username', username);
+        
         let room = urlParams.get('room') || 'general';
-
+        console.log('room', room);
+        
         if (!username) {
             username = prompt('Please enter your username:') || 'User' + Math.floor(Math.random() * 1000);
             window.history.replaceState({}, '', `?username=${username}&room=${room}`);
@@ -125,7 +150,7 @@
 
         // Connect to the Socket.IO server
         const socket = io();
-
+        console.log('socket connected', socket);
         // DOM elements
         const messageInput = document.getElementById('message-input');
         const sendButton = document.getElementById('send-button');
@@ -140,11 +165,38 @@
         sendButton.disabled = false;
         messageInput.focus();
 
+        // Track pending messages
+        const pendingMessages = new Map();
+        let messageCounter = 0;
+
         // Send message on button click or Enter key
         function sendMessage() {
             const message = messageInput.value.trim();
             if (message) {
-                socket.emit('message', { message });
+                const tempId = 'temp-' + Date.now() + '-' + (messageCounter++);
+                const messageData = { 
+                    message: message,
+                    tempId: tempId
+                };
+                
+                // Add to pending messages
+                pendingMessages.set(tempId, {
+                    text: message,
+                    timestamp: new Date().toLocaleTimeString(),
+                    status: 'sending'
+                });
+                
+                // Display the message immediately
+                displayMessage({
+                    username: username,
+                    message: message,
+                    timestamp: new Date().toLocaleTimeString(),
+                    tempId: tempId,
+                    status: 'sending'
+                }, true);
+                
+                // Emit the message
+                socket.emit('message', messageData);
                 messageInput.value = '';
             }
         }
@@ -156,25 +208,168 @@
             }
         });
 
+        // Display a message in the chat
+        function displayMessage(data, isOwnMessage = false) {
+            console.log('displayMessage', data);
+            let messageDiv = document.querySelector(`[data-temp-id="${data.tempId}"]`) || 
+                            document.querySelector(`[data-msg-id="${data.id}"]`);
+            
+            if (!messageDiv) {
+                messageDiv = document.createElement('div');
+                messageDiv.className = `message ${data.username === username ? 'sent' : 'received'}`;
+                if (data.tempId) messageDiv.setAttribute('data-temp-id', data.tempId);
+                if (data.id) messageDiv.setAttribute('data-msg-id', data.id);
+                
+                // Add direct message indicator
+                if (data.type === 'direct') {
+                    const indicator = document.createElement('div');
+                    indicator.className = 'direct-message-indicator';
+                    indicator.textContent = data.username === username ? 
+                        `To ${data.original_message?.split(' ')[0] || 'user'}` : 
+                        `From ${data.username}`;
+                    messageDiv.prepend(indicator);
+                }
+                
+                chatMessages.appendChild(messageDiv);
+            }
+            
+            // Update status text and class
+            let statusText = '';
+            let statusClass = '';
+            
+            switch(data.status) {
+                case 'sending':
+                    statusText = 'Sending...';
+                    statusClass = 'sending';
+                    break;
+                case 'queued':
+                    statusText = 'Queued';
+                    statusClass = 'queued';
+                    break;
+                case 'delivered':
+                    statusText = '✓';
+                    statusClass = 'delivered';
+                    break;
+                default:
+                    statusText = '';
+            }
+            
+            // Only update the message content if it hasn't been displayed yet
+            if (!messageDiv.querySelector('.message-text')) {
+                messageDiv.innerHTML = `
+                    <div class="message-header">${data.username}</div>
+                    <div class="message-text">${data.message}</div>
+                    <div class="message-time">
+                        ${data.timestamp}
+                        ${isOwnMessage ? `<span class="message-status ${statusClass}">${statusText}</span>` : ''}
+                    </div>
+                `;
+            } else if (isOwnMessage) {
+                // Just update the status if the message already exists
+                const statusElement = messageDiv.querySelector('.message-status');
+                if (statusElement) {
+                    statusElement.textContent = statusText;
+                    statusElement.className = `message-status ${statusClass}`;
+                }
+            }
+            
+            // Update message class based on status
+            if (data.status === 'delivered') {
+                messageDiv.classList.add('delivered');
+                
+                // If this was a pending message, remove it
+                if (data.tempId) {
+                    pendingMessages.delete(data.tempId);
+                }
+            }
+            
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            return messageDiv;
+        }
+
         // Handle incoming messages
         socket.on('message', (data) => {
-            const messageDiv = document.createElement('div');
-            messageDiv.className = `message ${data.username === username ? 'sent' : 'received'}`;
+            console.log('message received', data);
             
-            messageDiv.innerHTML = `
-                <div class="message-header">${data.username}</div>
-                <div class="message-text">${data.message}</div>
-                <div class="message-time">${data.timestamp}</div>
-            `;
+            // Check if this is a direct message to the current user
+            const isDirectMessage = data.type === 'direct' && 
+                                 (data.username !== username || data.original_message);
             
-            chatMessages.appendChild(messageDiv);
-            chatMessages.scrollTop = chatMessages.scrollHeight;
+            // Handle message status updates
+            if (data.tempId && pendingMessages.has(data.tempId)) {
+                const pendingMsg = pendingMessages.get(data.tempId);
+                if (pendingMsg) {
+                    pendingMsg.status = data.status;
+                    
+                    // Update the message display
+                    displayMessage({
+                        ...data,
+                        status: data.status || 'delivered',
+                        username: username, // Show as our own message
+                        tempId: data.tempId
+                    }, true);
+                    
+                    // If we have a permanent ID now, update our tracking
+                    if (data.id) {
+                        pendingMsg.id = data.id;
+                    }
+                    
+                    return;
+                }
+            }
+            
+            // Handle new incoming messages
+            displayMessage({
+                ...data,
+                status: data.status || 'delivered'
+            });
+            
+            // Notify user for direct messages
+            if (isDirectMessage && document.hidden) {
+                // You could add a notification here
+                console.log('New direct message from', data.username);
+            }
+        });
+        
+        // Handle message acknowledgment
+        socket.on('message_ack', (data) => {
+            console.log('message_ack received', data);
+            
+            // Update the message in our pending messages
+            if (pendingMessages.has(data.tempId)) {
+                const pendingMsg = pendingMessages.get(data.tempId);
+                if (pendingMsg) {
+                    pendingMsg.status = 'delivered';
+                    pendingMsg.id = data.msgId; // Store the permanent ID
+                }
+            }
+            
+            // Update the message in the UI
+            const messageElement = document.querySelector(`[data-temp-id="${data.tempId}"]`);
+            if (messageElement) {
+                // Update the message element with the permanent ID
+                messageElement.setAttribute('data-msg-id', data.msgId);
+                messageElement.removeAttribute('data-temp-id');
+                
+                // Update the status indicator
+                const statusElement = messageElement.querySelector('.message-status');
+                if (statusElement) {
+                    statusElement.textContent = '✓';
+                    statusElement.className = 'message-status delivered';
+                    messageElement.classList.add('delivered');
+                }
+                
+                // Remove from pending messages after a short delay
+                setTimeout(() => {
+                    pendingMessages.delete(data.tempId);
+                }, 1000);
+            }
         });
 
         // Handle user status updates
         socket.on('user_status', (data) => {
             userStatus.innerHTML = `User ${data.username} is now <span class="online">${data.status}</span>`;
-            
+            console.log('user status', data);
             // Clear the status after 3 seconds
             setTimeout(() => {
                 if (userStatus.textContent.includes(data.username)) {
@@ -186,6 +381,18 @@
         // Handle connection status
         socket.on('connect', () => {
             userStatus.textContent = 'Connected to chat';
+            
+            // Resend any pending messages on reconnect
+            pendingMessages.forEach((msg, tempId) => {
+                if (msg.status === 'sending') {
+                    socket.emit('message', {
+                        message: msg.text,
+                        tempId: tempId
+                    });
+                }
+            });
+            console.log('user connected');
+            
             setTimeout(() => {
                 if (userStatus.textContent === 'Connected to chat') {
                     userStatus.textContent = '';
